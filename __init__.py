@@ -119,11 +119,93 @@ def find_group_node(material):
             return node
     return None
 
+class PaintedColorOverrideItem(bpy.types.PropertyGroup):
+    material: bpy.props.PointerProperty(
+        name="Material",
+        type=bpy.types.Material,
+    )
+    painted_color: bpy.props.FloatVectorProperty(
+        name="Painted Color",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 1.0, 1.0),
+    )
+    enabled: bpy.props.BoolProperty(
+        name="Enabled",
+        default=True,
+    )
+
+class TXA_UL_painted_color_overrides(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        row.prop(item, "material", text="", icon='MATERIAL')
+        row.prop(item, "painted_color", text="")
+
+
+class OBJECT_OT_add_painted_color_override(bpy.types.Operator):
+    bl_idname = "object.txa_add_painted_color_override"
+    bl_label = "Add Painted Color Override"
+
+    def execute(self, context):
+        obj = context.object
+        obj.txa_painted_color_overrides.add()
+        obj.txa_painted_color_override_index = len(obj.txa_painted_color_overrides) - 1
+        return {"FINISHED"}
+
+
+class OBJECT_OT_remove_painted_color_override(bpy.types.Operator):
+    bl_idname = "object.txa_remove_painted_color_override"
+    bl_label = "Remove Painted Color Override"
+
+    def execute(self, context):
+        obj = context.object
+        index = obj.txa_painted_color_override_index
+        if 0 <= index < len(obj.txa_painted_color_overrides):
+            obj.txa_painted_color_overrides.remove(index)
+            obj.txa_painted_color_override_index = min(
+                index, len(obj.txa_painted_color_overrides) - 1
+            )
+        return {"FINISHED"}
+
+
+class OBJECT_PT_txa_overrides(bpy.types.Panel):
+    bl_label = "Overrides"
+    bl_idname = "OBJECT_PT_txa_overrides"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+
+        box = layout.box()
+        box.label(text="Painted Color")
+
+        row = box.row()
+        row.template_list(
+            "TXA_UL_painted_color_overrides", "",
+            obj, "txa_painted_color_overrides",
+            obj, "txa_painted_color_override_index",
+            rows=3,
+        )
+
+        col = row.column(align=True)
+        col.operator("object.txa_add_painted_color_override", icon='ADD', text="")
+        col.operator("object.txa_remove_painted_color_override", icon='REMOVE', text="")
 
 class glTF2ExportUserExtension:
     def __init__(self):
         from io_scene_gltf2.io.com.gltf2_io_extensions import Extension
         self.Extension = Extension
+        self._pending_overrides = {}
 
     def gather_material_hook(self, gltf2_object, blender_material, export_settings):
         if not blender_material or not blender_material.use_nodes:
@@ -158,41 +240,27 @@ class glTF2ExportUserExtension:
         )
 
         painted_color_socket = group_node.inputs.get("Painted Color")
-        if painted_color_socket and not painted_color_socket.is_linked:
-            gltf2_object.painted_color = list(painted_color_socket.default_value[:3])
-        else:
-            gltf2_object.painted_color = None
+        gltf2_object.painted_color = True if painted_color_socket is not None else None
 
     def gather_node_hook(self, gltf2_object, blender_object, export_settings):
-        if not blender_object or not hasattr(blender_object, 'material_slots'):
+        if not blender_object:
             return
 
         pending_overrides = []
 
-        for slot in blender_object.material_slots:
-            mat = slot.material
-            if not mat or not mat.use_nodes:
-                continue
+        # Only manual overrides from the "Overrides" panel go on the node
+        if hasattr(blender_object, "txa_painted_color_overrides"):
+            for item in blender_object.txa_painted_color_overrides:
+                if not item.material:
+                    continue
+                pending_overrides.append({
+                    "material_name": item.material.name,
+                    "painted_color": list(item.painted_color[:3]),
+                    "enabled": item.enabled,
+                })
 
-            group_node = find_group_node(mat)
-            if not group_node:
-                continue
-
-            painted_color_socket = group_node.inputs.get("Painted Color")
-            if not painted_color_socket or painted_color_socket.is_linked:
-                continue
-
-            painted_color = list(painted_color_socket.default_value[:3])
-
-            pending_overrides.append({
-                "material_name": mat.name,
-                "painted_color": painted_color
-            })
-
-        if not pending_overrides:
-            return
-
-        gltf2_object.pending_painted_overrides = pending_overrides
+        if pending_overrides:
+            self._pending_overrides[gltf2_object.name] = pending_overrides
 
     def gather_gltf_extensions_hook(self, gltf_data, export_settings):
         mesh_instanced_materials_used = False
@@ -241,33 +309,33 @@ class glTF2ExportUserExtension:
             mat.extensions = mat.extensions or {}
             mat.extensions[txa_extension_name] = extension_data
 
-        # ---- Resolve node overrides using global material index ----
         material_index_map = {}
         for i, mat in enumerate(gltf_data.materials):
             material_index_map[mat.name] = i
 
+        pending_overrides_map = getattr(self, '_pending_overrides', {})
+
         for node in gltf_data.nodes:
-            if not hasattr(node, 'pending_painted_overrides'):
+            if node.name not in pending_overrides_map:
                 continue
 
             overrides = []
-            for pending in node.pending_painted_overrides:
+            for pending in pending_overrides_map[node.name]:
                 mat_index = material_index_map.get(pending["material_name"])
                 if mat_index is None:
                     continue
                 overrides.append({
                     "Material": mat_index,
-                    "Enabled": True,
+                    "Enabled": pending["enabled"],
                     "Overrides": {
-                        "paintedColor": pending["painted_color"]
+                        "PaintedColor": pending["painted_color"]
                     }
                 })
 
             if overrides:
                 node.extensions = node.extensions or {}
-                node.extensions[txa_node_extension_name] = {"overrides": overrides}
+                node.extensions[txa_node_extension_name] = {"properties": overrides}
                 node_overrides_used = True
-        # ---- End node overrides ----
 
         if mesh_instanced_materials_used:
             if not gltf_data.extensions_used:
@@ -282,10 +350,33 @@ class glTF2ExportUserExtension:
                 gltf_data.extensions_used.append(txa_node_extension_name)
 
 
+classes = (
+    PaintedColorOverrideItem,
+    TXA_UL_painted_color_overrides,
+    OBJECT_OT_add_painted_color_override,
+    OBJECT_OT_remove_painted_color_override,
+    OBJECT_PT_txa_overrides,
+    NODE_OT_MASK_TEXTURE,
+)
+
+
 def register():
-    bpy.utils.register_class(NODE_OT_MASK_TEXTURE)
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+    bpy.types.Object.txa_painted_color_overrides = bpy.props.CollectionProperty(
+        type=PaintedColorOverrideItem
+    )
+    bpy.types.Object.txa_painted_color_override_index = bpy.props.IntProperty(default=0)
+
     bpy.types.NODE_MT_category_shader_output.append(add_gltf_mask_texture_to_menu)
 
 
 def unregister():
-    bpy.utils.unregister_class(NODE_OT_MASK_TEXTURE)
+    bpy.types.NODE_MT_category_shader_output.remove(add_gltf_mask_texture_to_menu)
+
+    del bpy.types.Object.txa_painted_color_override_index
+    del bpy.types.Object.txa_painted_color_overrides
+
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
